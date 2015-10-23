@@ -44,7 +44,7 @@ def _load_svmlight_file(f, dtype, bint multilabel, bint zero_based,
         data = array.array("d")
     indices = array.array("i")
     indptr = array.array("i", [0])
-    query = array.array("l")
+    query = array.array("i")
 
     if multilabel:
         labels = []
@@ -80,7 +80,7 @@ def _load_svmlight_file(f, dtype, bint multilabel, bint zero_based,
             _, value = features[0].split(COLON, 1)
             if query_id:
                 array.resize_smart(query, len(query) + 1)
-                query[len(query) - 1] = long(value)
+                query[len(query) - 1] = int(value)
             features.pop(0)
             n_features -= 1
 
