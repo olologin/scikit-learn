@@ -33,8 +33,7 @@ __all__ = ["BaggingClassifier",
 MAX_INT = np.iinfo(np.int32).max
 
 
-def _parallel_build_estimators(n_estimators, ensemble, X, y, sample_weight,
-                               max_samples, seeds, verbose):
+def _parallel_build_estimators(ensemble, X, y, sample_weight, max_samples, seed, verbose):
     """Private function used to build a batch of estimators within a job."""
     # Retrieve settings
     n_samples, n_features = X.shape
@@ -55,139 +54,123 @@ def _parallel_build_estimators(n_estimators, ensemble, X, y, sample_weight,
     if not support_sample_weight and sample_weight is not None:
         raise ValueError("The base estimator doesn't support sample weight")
 
-    # Build estimators
-    estimators = []
-    estimators_samples = []
-    estimators_features = []
+    if verbose > 1:
+        print("building estimator %d of %d" % (i + 1, n_estimators))
 
-    for i in range(n_estimators):
-        if verbose > 1:
-            print("building estimator %d of %d" % (i + 1, n_estimators))
+    random_state = check_random_state(seed)
+    seed = random_state.randint(MAX_INT) # ???
+    estimator = ensemble._make_estimator(append=False)
 
-        random_state = check_random_state(seeds[i])
-        seed = random_state.randint(MAX_INT)
-        estimator = ensemble._make_estimator(append=False)
+    try:  # Not all estimator accept a random_state
+        estimator.set_params(random_state=seed)
+    except ValueError:
+        pass
 
-        try:  # Not all estimator accept a random_state
-            estimator.set_params(random_state=seed)
-        except ValueError:
-            pass
+    # Draw features
+    if bootstrap_features:
+        features = random_state.randint(0, n_features, max_features)
+    else:
+        features = sample_without_replacement(n_features,
+                                              max_features,
+                                              random_state=random_state)
 
-        # Draw features
-        if bootstrap_features:
-            features = random_state.randint(0, n_features, max_features)
+    # Draw samples, using sample weights, and then fit
+    if support_sample_weight:
+        if sample_weight is None:
+            curr_sample_weight = np.ones((n_samples,))
         else:
-            features = sample_without_replacement(n_features,
-                                                  max_features,
-                                                  random_state=random_state)
+            curr_sample_weight = sample_weight.copy()
 
-        # Draw samples, using sample weights, and then fit
-        if support_sample_weight:
-            if sample_weight is None:
-                curr_sample_weight = np.ones((n_samples,))
-            else:
-                curr_sample_weight = sample_weight.copy()
-
-            if bootstrap:
-                indices = random_state.randint(0, n_samples, max_samples)
-                sample_counts = bincount(indices, minlength=n_samples)
-                curr_sample_weight *= sample_counts
-
-            else:
-                not_indices = sample_without_replacement(
-                    n_samples,
-                    n_samples - max_samples,
-                    random_state=random_state)
-
-                curr_sample_weight[not_indices] = 0
-
-            estimator.fit(X[:, features], y, sample_weight=curr_sample_weight)
-            samples = curr_sample_weight > 0.
-
-        # Draw samples, using a mask, and then fit
-        else:
-            if bootstrap:
-                indices = random_state.randint(0, n_samples, max_samples)
-            else:
-                indices = sample_without_replacement(n_samples,
-                                                     max_samples,
-                                                     random_state=random_state)
-
+        if bootstrap:
+            indices = random_state.randint(0, n_samples, max_samples)
             sample_counts = bincount(indices, minlength=n_samples)
+            curr_sample_weight *= sample_counts
 
-            estimator.fit((X[indices])[:, features], y[indices])
-            samples = sample_counts > 0.
+        else:
+            not_indices = sample_without_replacement(
+                n_samples,
+                n_samples - max_samples,
+                random_state=random_state)
 
-        estimators.append(estimator)
-        estimators_samples.append(samples)
-        estimators_features.append(features)
+            curr_sample_weight[not_indices] = 0
 
-    return estimators, estimators_samples, estimators_features
+        estimator.fit(X[:, features], y, sample_weight=curr_sample_weight)
+        samples = curr_sample_weight > 0.
+
+    # Draw samples, using a mask, and then fit
+    else:
+        if bootstrap:
+            indices = random_state.randint(0, n_samples, max_samples)
+        else:
+            indices = sample_without_replacement(n_samples,
+                                                 max_samples,
+                                                 random_state=random_state)
+
+        sample_counts = bincount(indices, minlength=n_samples)
+
+        estimator.fit((X[indices])[:, features], y[indices])
+        samples = sample_counts > 0.
+
+    return estimator, samples, features
 
 
-def _parallel_predict_proba(estimators, estimators_features, X, n_classes):
+def _parallel_predict_proba(estimator, features, X, n_classes):
     """Private function used to compute (proba-)predictions within a job."""
     n_samples = X.shape[0]
     proba = np.zeros((n_samples, n_classes))
 
-    for estimator, features in zip(estimators, estimators_features):
-        if hasattr(estimator, "predict_proba"):
-            proba_estimator = estimator.predict_proba(X[:, features])
+    if hasattr(estimator, "predict_proba"):
+        proba_estimator = estimator.predict_proba(X[:, features])
 
-            if n_classes == len(estimator.classes_):
-                proba += proba_estimator
-
-            else:
-                proba[:, estimator.classes_] += \
-                    proba_estimator[:, range(len(estimator.classes_))]
+        if n_classes == len(estimator.classes_):
+            proba += proba_estimator
 
         else:
-            # Resort to voting
-            predictions = estimator.predict(X[:, features])
+            proba[:, estimator.classes_] += \
+                proba_estimator[:, range(len(estimator.classes_))]
 
-            for i in range(n_samples):
-                proba[i, predictions[i]] += 1
+    else:
+        # Resort to voting
+        predictions = estimator.predict(X[:, features])
+
+        for i in range(n_samples):
+            proba[i, predictions[i]] += 1
 
     return proba
 
 
-def _parallel_predict_log_proba(estimators, estimators_features, X, n_classes):
+def _parallel_predict_log_proba(estimator, features, X, n_classes):
     """Private function used to compute log probabilities within a job."""
     n_samples = X.shape[0]
     log_proba = np.empty((n_samples, n_classes))
     log_proba.fill(-np.inf)
     all_classes = np.arange(n_classes, dtype=np.int)
 
-    for estimator, features in zip(estimators, estimators_features):
-        log_proba_estimator = estimator.predict_log_proba(X[:, features])
+    log_proba_estimator = estimator.predict_log_proba(X[:, features])
 
-        if n_classes == len(estimator.classes_):
-            log_proba = np.logaddexp(log_proba, log_proba_estimator)
+    if n_classes == len(estimator.classes_):
+        log_proba = np.logaddexp(log_proba, log_proba_estimator)
 
-        else:
-            log_proba[:, estimator.classes_] = np.logaddexp(
-                log_proba[:, estimator.classes_],
-                log_proba_estimator[:, range(len(estimator.classes_))])
+    else:
+        log_proba[:, estimator.classes_] = np.logaddexp(
+            log_proba[:, estimator.classes_],
+            log_proba_estimator[:, range(len(estimator.classes_))])
 
-            missing = np.setdiff1d(all_classes, estimator.classes_)
-            log_proba[:, missing] = np.logaddexp(log_proba[:, missing],
-                                                 -np.inf)
+        missing = np.setdiff1d(all_classes, estimator.classes_)
+        log_proba[:, missing] = np.logaddexp(log_proba[:, missing],
+                                             -np.inf)
 
     return log_proba
 
 
-def _parallel_decision_function(estimators, estimators_features, X):
+def _parallel_decision_function(estimator, features, X):
     """Private function used to compute decisions within a job."""
-    return sum(estimator.decision_function(X[:, features])
-               for estimator, features in zip(estimators,
-                                              estimators_features))
+    return estimator.decision_function(X[:, features])
 
 
-def _parallel_predict_regression(estimators, estimators_features, X):
+def _parallel_predict_regression(estimator, features, X):
     """Private function used to compute predictions within a job."""
-    return sum(estimator.predict(X[:, features])
-               for estimator, features in zip(estimators,
-                                              estimators_features))
+    return estimator.predict(X[:, features])
 
 
 class BaseBagging(with_metaclass(ABCMeta, BaseEnsemble)):
@@ -341,8 +324,8 @@ class BaseBagging(with_metaclass(ABCMeta, BaseEnsemble)):
             return self
 
         # Parallel loop
-        n_jobs, n_estimators, starts = _partition_estimators(n_more_estimators,
-                                                             self.n_jobs)
+        n_jobs, _, _ = _partition_estimators(n_more_estimators,
+                                             self.n_jobs)
 
         # Advance random state to state after training
         # the first n_estimators
@@ -353,23 +336,19 @@ class BaseBagging(with_metaclass(ABCMeta, BaseEnsemble)):
 
         all_results = Parallel(n_jobs=n_jobs, verbose=self.verbose)(
             delayed(_parallel_build_estimators)(
-                n_estimators[i],
                 self,
                 X,
                 y,
                 sample_weight,
                 max_samples,
-                seeds[starts[i]:starts[i + 1]],
+                seeds[i],
                 verbose=self.verbose)
-            for i in range(n_jobs))
+            for i in range(n_more_estimators))
 
         # Reduce
-        self.estimators_ += list(itertools.chain.from_iterable(
-            t[0] for t in all_results))
-        self.estimators_samples_ += list(itertools.chain.from_iterable(
-            t[1] for t in all_results))
-        self.estimators_features_ += list(itertools.chain.from_iterable(
-            t[2] for t in all_results))
+        self.estimators_ += [t[0] for t in all_results]
+        self.estimators_samples_ += [t[1] for t in all_results]
+        self.estimators_features_ += [t[2] for t in all_results]
 
         if self.oob_score:
             self._set_oob_score(X, y)
@@ -636,16 +615,12 @@ class BaggingClassifier(BaseBagging, ClassifierMixin):
                              "".format(self.n_features_, X.shape[1]))
 
         # Parallel loop
-        n_jobs, n_estimators, starts = _partition_estimators(self.n_estimators,
-                                                             self.n_jobs)
+        n_jobs, _, _ = _partition_estimators(self.n_estimators,
+                                             self.n_jobs)
 
         all_proba = Parallel(n_jobs=n_jobs, verbose=self.verbose)(
-            delayed(_parallel_predict_proba)(
-                self.estimators_[starts[i]:starts[i + 1]],
-                self.estimators_features_[starts[i]:starts[i + 1]],
-                X,
-                self.n_classes_)
-            for i in range(n_jobs))
+            delayed(_parallel_predict_proba)(estimator, features, X, self.n_classes_)
+            for estimator, features in zip(self.estimators_, self.estimators_features_))
 
         # Reduce
         proba = sum(all_proba) / self.n_estimators
@@ -683,16 +658,12 @@ class BaggingClassifier(BaseBagging, ClassifierMixin):
                                  "".format(self.n_features_, X.shape[1]))
 
             # Parallel loop
-            n_jobs, n_estimators, starts = _partition_estimators(
+            n_jobs, _, _ = _partition_estimators(
                 self.n_estimators, self.n_jobs)
 
             all_log_proba = Parallel(n_jobs=n_jobs, verbose=self.verbose)(
-                delayed(_parallel_predict_log_proba)(
-                    self.estimators_[starts[i]:starts[i + 1]],
-                    self.estimators_features_[starts[i]:starts[i + 1]],
-                    X,
-                    self.n_classes_)
-                for i in range(n_jobs))
+                delayed(_parallel_predict_log_proba)(estimator, features, X, self.n_classes_)
+                for estimator, features in zip(self.estimators_, self.estimators_features_))
 
             # Reduce
             log_proba = all_log_proba[0]
@@ -738,15 +709,12 @@ class BaggingClassifier(BaseBagging, ClassifierMixin):
                              "".format(self.n_features_, X.shape[1]))
 
         # Parallel loop
-        n_jobs, n_estimators, starts = _partition_estimators(self.n_estimators,
-                                                             self.n_jobs)
+        n_jobs, _, _ = _partition_estimators(self.n_estimators,
+                                             self.n_jobs)
 
         all_decisions = Parallel(n_jobs=n_jobs, verbose=self.verbose)(
-            delayed(_parallel_decision_function)(
-                self.estimators_[starts[i]:starts[i + 1]],
-                self.estimators_features_[starts[i]:starts[i + 1]],
-                X)
-            for i in range(n_jobs))
+            delayed(_parallel_decision_function)(estimator, features, X)
+            for estimator, features in zip(self.estimators_, self.estimators_features_))
 
         # Reduce
         decisions = sum(all_decisions) / self.n_estimators
@@ -908,15 +876,12 @@ class BaggingRegressor(BaseBagging, RegressorMixin):
         X = check_array(X, accept_sparse=['csr', 'csc'])
 
         # Parallel loop
-        n_jobs, n_estimators, starts = _partition_estimators(self.n_estimators,
-                                                             self.n_jobs)
+        n_jobs, _, _ = _partition_estimators(self.n_estimators,
+                                             self.n_jobs)
 
         all_y_hat = Parallel(n_jobs=n_jobs, verbose=self.verbose)(
-            delayed(_parallel_predict_regression)(
-                self.estimators_[starts[i]:starts[i + 1]],
-                self.estimators_features_[starts[i]:starts[i + 1]],
-                X)
-            for i in range(n_jobs))
+            delayed(_parallel_predict_regression)(estimator, features, X)
+            for estimator, features in zip(self.estimators_, self.estimators_features_))
 
         # Reduce
         y_hat = sum(all_y_hat) / self.n_estimators
